@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python cache/artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Local tooling/cache outputs
+.cache/
+.pytest_cache/
+

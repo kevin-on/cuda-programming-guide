@@ -1,0 +1,13 @@
+If:
+  PathMatch: .*\.(cu|cuh)$
+CompileFlags:
+  Add:
+    - -xcuda
+    - --cuda-path=/home/jinpyo/cuda
+    - --cuda-gpu-arch=sm_90
+    - --no-cuda-version-check
+    - -std=c++17
+    - -I/home/jinpyo/cuda/targets/x86_64-linux/include
+    - -D_CG_CLUSTER_INTRINSICS_AVAILABLE=1
+    - -include
+    - cuda_runtime.h

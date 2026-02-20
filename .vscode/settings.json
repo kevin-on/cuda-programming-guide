@@ -2,10 +2,13 @@
   "editor.formatOnSave": true,
   "editor.defaultFormatter": "xaver.clang-format",
   "files.associations": {
-    "*.cu": "cpp",
-    "*.cuh": "cpp"
+    "*.cu": "cuda-cpp",
+    "*.cuh": "cuda-cpp"
   },
   "[cpp]": {
     "editor.defaultFormatter": "xaver.clang-format"
-  }
+  },
+  "clangd.arguments": [
+    "--query-driver=/home/jinpyo/cuda/bin/nvcc"
+  ],
 }

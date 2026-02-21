@@ -2,8 +2,8 @@
   "editor.formatOnSave": true,
   "editor.defaultFormatter": "xaver.clang-format",
   "files.associations": {
-    "*.cu": "cuda-cpp",
-    "*.cuh": "cuda-cpp"
+    "*.cu": "cpp",
+    "*.cuh": "cpp"
   },
   "[cpp]": {
     "editor.defaultFormatter": "xaver.clang-format"

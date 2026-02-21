@@ -12,3 +12,7 @@ __pycache__/
 
 # Build outputs
 build/
+
+# logs
+logs/
+*.log

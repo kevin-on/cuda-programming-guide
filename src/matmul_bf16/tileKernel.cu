@@ -23,16 +23,17 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
      *
      * Benchmark (8192 x 8192 x 8192 matmul on A100)
      * Note: cuBLAS=271.32 TFLOPS, theoretical peak=312 TFLOPS
-     * BM=64, BN=64, BK=64: 15.27 TFLOPS
+     * BM=64, BN=64, BK=64: 41.34 TFLOPS
      */
 
-    __shared__ bf16 sA[BM * BK]; // TODO: Use swizzle (XOR) to avoid bank conflicts
-    __shared__ bf16 sB[BK * BN];
-    __shared__ float sC[BM * BN];
-
-    int ldsa = BK;
-    int ldsb = BN;
-    int ldsc = BN;
+    // Note: leading dimensions should be multiple of 16 bytes for wmma::load_matrix_sync and
+    // wmma::store_matrix_sync.
+    constexpr int ldsa = BK + 8;
+    constexpr int ldsb = BN + 8;
+    constexpr int ldsc = BN + 8; // +8 is slightly better than +4. TODO: Investigate why.
+    __shared__ bf16 sA[BM * ldsa];
+    __shared__ bf16 sB[BK * ldsb];
+    __shared__ float sC[BM * ldsc];
 
     int bx0 = blockIdx.x * BN;
     int by0 = blockIdx.y * BM;
@@ -68,8 +69,8 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
         /* -- SRAM -> Register  -- */
         /* -- Register @ Register => Register  -- */
         for (int k = 0; k < BK; k += 16) {
-            wmma::load_matrix_sync(a_frag, &sA[INDX(wy0, k, ldsa)], BK);
-            wmma::load_matrix_sync(b_frag, &sB[INDX(k, wx0, ldsb)], BN);
+            wmma::load_matrix_sync(a_frag, &sA[INDX(wy0, k, ldsa)], ldsa);
+            wmma::load_matrix_sync(b_frag, &sB[INDX(k, wx0, ldsb)], ldsb);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
 

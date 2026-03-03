@@ -8,13 +8,19 @@ LABEL="${3:-}"
 shift 2
 [[ -n "$LABEL" ]] && shift
 
-mkdir -p build profiles
+SRC_DIR="src/matmul_bf16"
 
-nvcc -O2 -lineinfo -std=c++17 -arch=sm_80 src/matmul_bf16/*.cu -o "$BIN" -lcublas
+mkdir -p build
+
+nvcc -O2 -lineinfo -std=c++17 -arch=sm_80 "$SRC_DIR"/*.cu -o "$BIN" -lcublas
 
 SUFFIX=$(echo "$SPEC" | tr ':=,' '_')
 [[ -n "$LABEL" ]] && SUFFIX="${SUFFIX}_${LABEL}"
-REPORT="profiles/ncu_${SUFFIX}.ncu-rep"
+PROFILE_DIR="profiles/matmul_bf16/${SUFFIX}"
+mkdir -p "$PROFILE_DIR"
+REPORT="${PROFILE_DIR}/profile.ncu-rep"
+
+cp "$SRC_DIR"/*.cu "$SRC_DIR"/*.cuh "$PROFILE_DIR/"
 
 ncu --set full \
     --export "$REPORT" \

@@ -23,7 +23,7 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
      *
      * Benchmark (8192 x 8192 x 8192 matmul on A100)
      * Note: cuBLAS=271.32 TFLOPS, theoretical peak=312 TFLOPS
-     * BM=64, BN=64, BK=64: 41.34 TFLOPS
+     * BM=64, BN=64, BK=64: 42.24 TFLOPS
      */
 
     // Note: leading dimensions should be multiple of 16 bytes for wmma::load_matrix_sync and
@@ -38,6 +38,7 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
     int bx0 = blockIdx.x * BN;
     int by0 = blockIdx.y * BM;
     int warpIdx = threadIdx.x / 32; // 1d warp index in 2d grid (BM / 16) * (BN / 16)
+    int warpOffset = threadIdx.x % 32;
     int wy0 = 16 * (warpIdx / (BN / 16));
     int wx0 = 16 * (warpIdx % (BN / 16));
 
@@ -79,11 +80,11 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
 
     /* -- Register -> (Cache) -> DRAM  -- */
     wmma::store_matrix_sync(&sC[INDX(wy0, wx0, ldsc)], c_frag, ldsc, wmma::mem_row_major);
-    for (int y = 0; y < 16; y++) {
-        for (int x = 0; x < 16; x++) {
-            C[INDX(by0 + wy0 + y, bx0 + wx0 + x, m)] =
-                __float2bfloat16(sC[INDX(wy0 + y, wx0 + x, ldsc)]);
-        }
+    for (int idx = warpOffset; idx < 16 * 16; idx += 32) {
+        int y = idx / 16;
+        int x = idx % 16;
+        C[INDX(by0 + wy0 + y, bx0 + wx0 + x, m)] =
+            __float2bfloat16(sC[INDX(wy0 + y, wx0 + x, ldsc)]);
     }
 }
 

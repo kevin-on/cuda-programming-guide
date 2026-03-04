@@ -1,0 +1,69 @@
+#include <cuda/cmath>
+#include <mma.h>
+#include <stdio.h>
+
+using namespace nvcuda;
+
+using bf16 = __nv_bfloat16;
+
+#define INDX(row, col, ld) ((row) * (ld) + (col))
+
+__global__ void testLdmatrix() {
+    __shared__ bf16 sA[32 * 32];
+
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 32 * 32; i++) {
+            int y = i / 32;
+            int x = i % 32;
+            sA[INDX(y, x, 32)] = __ushort_as_bfloat16((unsigned short)(i));
+        }
+    }
+
+    __syncthreads();
+
+    bf16 a_frag[8];
+    bf16 a_trans_frag[8];
+    uint32_t *ra = reinterpret_cast<uint32_t *>(a_frag);
+    uint32_t *rat = reinterpret_cast<uint32_t *>(a_trans_frag);
+
+    uint32_t laneId = threadIdx.x % 32;
+    uint32_t pRow = laneId % 16;
+    uint32_t pCol = (laneId < 16) ? 0 : 8;
+    uint32_t pa = __cvta_generic_to_shared(&sA[INDX(pRow, pCol, 32)]);
+
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(ra[0]), "=r"(ra[1]), "=r"(ra[2]), "=r"(ra[3])
+                 : "r"(pa));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(rat[0]), "=r"(rat[1]), "=r"(rat[2]), "=r"(rat[3])
+                 : "r"(pa));
+
+    int row[8], col[8];
+    for (int i = 0; i < 8; i++) {
+        unsigned short idx = __bfloat16_as_ushort(a_frag[i]);
+        row[i] = idx / 32;
+        col[i] = idx % 32;
+    }
+    printf("[threadIdx.x: %2d] a_frag: (%2d,%2d) (%2d,%2d) (%2d,%2d) (%2d,%2d) (%2d,%2d) (%2d,%2d) "
+           "(%2d,%2d) (%2d,%2d)\n",
+           threadIdx.x, row[0], col[0], row[1], col[1], row[2], col[2], row[3], col[3], row[4],
+           col[4], row[5], col[5], row[6], col[6], row[7], col[7]);
+
+    __syncthreads();
+    for (int i = 0; i < 8; i++) {
+        unsigned short idx = __bfloat16_as_ushort(a_trans_frag[i]);
+        row[i] = idx / 32;
+        col[i] = idx % 32;
+    }
+    printf("[threadIdx.x: %2d] a_trans_frag: (%2d,%2d) (%2d,%2d) (%2d,%2d) (%2d,%2d) (%2d,%2d) "
+           "(%2d,%2d) "
+           "(%2d,%2d) (%2d,%2d)\n",
+           threadIdx.x, row[0], col[0], row[1], col[1], row[2], col[2], row[3], col[3], row[4],
+           col[4], row[5], col[5], row[6], col[6], row[7], col[7]);
+}
+
+int main() {
+    testLdmatrix<<<1, 32>>>();
+    cudaDeviceSynchronize();
+    return 0;
+}

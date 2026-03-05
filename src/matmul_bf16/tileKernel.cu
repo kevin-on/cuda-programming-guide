@@ -13,7 +13,8 @@ using namespace nvcuda;
 template <int BM, int BN, int BK, int WM, int WN>
 __global__ void
 tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = nullptr,
-                 uint64_t *d_sram_to_reg_debug = nullptr, uint64_t *d_wait_debug = nullptr) {
+                 uint64_t *d_sram_to_reg_debug = nullptr,
+                 uint64_t *d_wait_debug = nullptr) {
     /**
      * - Each thread block computes a BM x BN tile of the output matrix C.
      * - Each warp computes a WM x WN tile of the output matrix C.
@@ -46,11 +47,16 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
     int wy0 = WM * (warpIdx / (BN / WN));
     int wx0 = WN * (warpIdx % (BN / WN));
 
-    bf16 a_frag[8];
-    bf16 b_frag[8];
-    float c_frag[(WM * WN / 256) * 8] = {0.0f};
-    uint32_t *ra = reinterpret_cast<uint32_t *>(a_frag);
-    uint32_t *rb = reinterpret_cast<uint32_t *>(b_frag);
+    bf16 a0_frag[8];
+    bf16 b0_frag[8];
+    bf16 a1_frag[16];
+    bf16 b1_frag[16];
+    uint32_t *ra0 = reinterpret_cast<uint32_t *>(a0_frag);
+    uint32_t *rb0 = reinterpret_cast<uint32_t *>(b0_frag);
+    uint32_t *ra1 = reinterpret_cast<uint32_t *>(a1_frag);
+    uint32_t *rb1 = reinterpret_cast<uint32_t *>(b1_frag);
+
+    float c_frag[(WM * WN / 256) * 8] = {0.0f}; // TODO: Consider double buffering for c_frag
 
     uint32_t laneId = threadIdx.x % 32;
 
@@ -122,36 +128,68 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
         bf16 *curSB = &sB[(iterCount & 1) * BK * ldsb];
         uint32_t pRow = laneId % 16;
         uint32_t pCol = (laneId < 16) ? 0 : 8;
+
+        int mmaIterCount = 0;
+        float *last_c_frag_ptr = nullptr;
+#pragma unroll
         for (int k = 0; k < BK; k += 16) {
-            for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++) {
+#pragma unroll
+            for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++, mmaIterCount++) {
                 int ty0 = 16 * (tileIdx / (WN / 16));
                 int tx0 = 16 * (tileIdx % (WN / 16));
                 uint32_t pa =
                     __cvta_generic_to_shared(&curSA[INDX(wy0 + ty0 + pRow, k + pCol, ldsa)]);
                 uint32_t pb =
                     __cvta_generic_to_shared(&curSB[INDX(k + pRow, wx0 + tx0 + pCol, ldsb)]);
-                float *c_frag_ptr = &c_frag[tileIdx * 8];
+                uint32_t *mmaRA = (mmaIterCount & 0x1) ? ra1 : ra0;
+                uint32_t *ldRA = (mmaIterCount & 0x1) ? ra0 : ra1;
+                uint32_t *mmaRB = (mmaIterCount & 0x1) ? rb1 : rb0;
+                uint32_t *ldRB = (mmaIterCount & 0x1) ? rb0 : rb1;
+
+                float *c_frag_ptr = last_c_frag_ptr;
+                last_c_frag_ptr = &c_frag[tileIdx * 8];
 
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(ra[0]), "=r"(ra[1]), "=r"(ra[2]), "=r"(ra[3])
+                             : "=r"(ldRA[0]), "=r"(ldRA[1]), "=r"(ldRA[2]), "=r"(ldRA[3])
                              : "r"(pa));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(rb[0]), "=r"(rb[1]), "=r"(rb[2]), "=r"(rb[3])
+                             : "=r"(ldRB[0]), "=r"(ldRB[1]), "=r"(ldRB[2]), "=r"(ldRB[3])
                              : "r"(pb));
+                if (mmaIterCount == 0)
+                    continue; // skip mma for the first iteration
+
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                              : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]), "+f"(c_frag_ptr[2]),
                                "+f"(c_frag_ptr[3])
-                             : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[0]),
-                               "r"(rb[1]));
+                             : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]),
+                               "r"(mmaRB[0]), "r"(mmaRB[1]));
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                              : "+f"(c_frag_ptr[4]), "+f"(c_frag_ptr[5]), "+f"(c_frag_ptr[6]),
                                "+f"(c_frag_ptr[7])
-                             : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[2]),
-                               "r"(rb[3]));
+                             : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]),
+                               "r"(mmaRB[2]), "r"(mmaRB[3]));
             }
         }
+
+        // Compute mma for the last iteration
+        uint32_t *mmaRA = (mmaIterCount & 0x1) ? ra1 : ra0;
+        uint32_t *mmaRB = (mmaIterCount & 0x1) ? rb1 : rb0;
+        float *c_frag_ptr = last_c_frag_ptr;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                     : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]), "+f"(c_frag_ptr[2]),
+                       "+f"(c_frag_ptr[3])
+                     : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]), "r"(mmaRB[0]),
+                       "r"(mmaRB[1]));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                     : "+f"(c_frag_ptr[4]), "+f"(c_frag_ptr[5]), "+f"(c_frag_ptr[6]),
+                       "+f"(c_frag_ptr[7])
+                     : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]), "r"(mmaRB[2]),
+                       "r"(mmaRB[3]));
+
 #ifdef DEBUG
         if (laneId == 0) {
             uint64_t sram_to_reg_t1 = clock64();
@@ -179,10 +217,12 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
     int warpsPerBlock = blockDim.x / 32;
     int blockLinear = blockIdx.x + blockIdx.y * gridDim.x;
     int globalWarp = blockLinear * warpsPerBlock + warpIdx;
-    if (laneId == 0 && sample_count > 0) {
-        d_prefetch_debug[globalWarp] += total_prefetch_cycles / sample_count;
-        d_sram_to_reg_debug[globalWarp] += total_sram_to_reg_cycles / sample_count;
-        d_wait_debug[globalWarp] += total_wait_cycles / sample_count;
+    if (laneId == 0) {
+        if (sample_count > 0) {
+            d_prefetch_debug[globalWarp] += total_prefetch_cycles / sample_count;
+            d_sram_to_reg_debug[globalWarp] += total_sram_to_reg_cycles / sample_count;
+            d_wait_debug[globalWarp] += total_wait_cycles / sample_count;
+        }
     }
 #endif
 
@@ -300,7 +340,9 @@ struct TileConfig {
     { BM, BN, BK, WM, WN, launchTileMatmul<BM, BN, BK, WM, WN> }
 
 static const TileConfig tileConfigs[] = {
-    TILE_CFG(128, 128, 32, 64, 64), // Current best config
+    TILE_CFG(128, 128, 32, 64, 64),
+    // TILE_CFG(128, 128, 32, 32, 32),
+    // TILE_CFG(128, 128, 32, 32, 16),
 };
 
 void runTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {

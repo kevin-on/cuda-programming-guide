@@ -11,6 +11,24 @@ while [[ $# -gt 0 ]]; do
         NVCC_FLAGS+=(-DDEBUG)
         shift
         ;;
+    --nvcc-flag)
+        shift
+        [[ $# -gt 0 ]] || {
+            echo "Missing value for --nvcc-flag" >&2
+            exit 1
+        }
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+            -- | --debug | --nvcc-flag)
+                break
+                ;;
+            *)
+                NVCC_FLAGS+=("$1")
+                shift
+                ;;
+            esac
+        done
+        ;;
     --)
         shift
         RUN_ARGS+=("$@")

@@ -59,7 +59,10 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
         bf16 *writeSA = &sA[((iterCount + 1) & 1) * BM * ldsa];
         bf16 *writeSB = &sB[((iterCount + 1) & 1) * BK * ldsb];
 
-        // /* -- DRAM -> SRAM -- */
+// /* -- DRAM -> SRAM -- */
+#ifdef DEBUG_SKIP_G2S_LOAD
+        // Do nothing
+#else
         // First iteration: load the first tile
         if (iterCount == 0) {
             for (int idx = threadIdx.x; idx < BM * (BK / 8); idx += blockDim.x) {
@@ -96,11 +99,15 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
             }
         }
         __pipeline_commit();
+#endif
 
         /* -- SRAM -> Register  -- */
         /* -- Register @ Register => Register  -- */
         uint32_t pRow = laneId % 16;
         uint32_t pCol = (laneId < 16) ? 0 : 8;
+#ifdef DEBUG_SKIP_MMA
+        uint32_t ldsm_keep = 0;
+#endif
 
         for (int k = 0; k < BK; k += 16) {
             for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++) {
@@ -113,12 +120,31 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
 
                 float *c_frag_ptr = &c_frag[tileIdx * 8];
 
+#ifdef DEBUG_SKIP_LDMATRIX
+                ra[0] = pa;
+                ra[1] = pa ^ 0x11111111u;
+                ra[2] = pa ^ 0x22222222u;
+                ra[3] = pa ^ 0x33333333u;
+                rb[0] = pb;
+                rb[1] = pb ^ 0x44444444u;
+                rb[2] = pb ^ 0x88888888u;
+                rb[3] = pb ^ 0xccccccccu;
+                asm volatile(""
+                             : "+r"(ra[0]), "+r"(ra[1]), "+r"(ra[2]), "+r"(ra[3]), "+r"(rb[0]),
+                               "+r"(rb[1]), "+r"(rb[2]), "+r"(rb[3]));
+#else
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(ra[0]), "=r"(ra[1]), "=r"(ra[2]), "=r"(ra[3])
                              : "r"(pa));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(rb[0]), "=r"(rb[1]), "=r"(rb[2]), "=r"(rb[3])
                              : "r"(pb));
+#endif
+
+#ifdef DEBUG_SKIP_MMA
+                ldsm_keep ^= (ra[0] ^ ra[1] ^ rb[0] ^ rb[1]);
+                ldsm_keep ^= (ra[2] ^ ra[3] ^ rb[2] ^ rb[3]);
+#else
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                              : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]), "+f"(c_frag_ptr[2]),
@@ -131,8 +157,15 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                                "+f"(c_frag_ptr[7])
                              : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[2]),
                                "r"(rb[3]));
+#endif
             }
         }
+#ifdef DEBUG_SKIP_MMA
+        if (laneId == 0) {
+            volatile uint32_t *sink = reinterpret_cast<volatile uint32_t *>(sA);
+            sink[warpIdx] = ldsm_keep;
+        }
+#endif
 
         __pipeline_wait_prior(0);
         __syncthreads();
@@ -146,12 +179,22 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
         int ty0 = 16 * (tileIdx / (WN / 16));
         int tx0 = 16 * (tileIdx % (WN / 16));
         float *c_frag_ptr = &c_frag[tileIdx * 8];
+#ifdef DEBUG_SKIP_R2G_STORE
+        volatile float *sink = reinterpret_cast<volatile float *>(sA);
+        float acc = 0.0f;
+        for (int j = 0; j < 8; j++)
+            acc += c_frag_ptr[j];
+        if (laneId == 0)
+            sink[warpIdx] = acc;
+        asm volatile("" ::: "memory");
+#else
         for (int i = 0; i < 8; i++) {
             uint32_t row = ((i % 4) < 2) ? groupId : groupId + 8;
             uint32_t col = (threadId_in_group * 2) + (i & 0x1) + (i < 4 ? 0 : 8);
             C[INDX(by0 + wy0 + ty0 + row, bx0 + wx0 + tx0 + col, m)] =
                 __float2bfloat16(c_frag_ptr[i]);
         }
+#endif
     }
 }
 

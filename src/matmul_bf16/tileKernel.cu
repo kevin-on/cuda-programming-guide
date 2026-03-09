@@ -11,10 +11,7 @@ using namespace nvcuda;
 #define INDX(row, col, ld) ((row) * (ld) + (col))
 
 template <int BM, int BN, int BK, int WM, int WN>
-__global__ void
-tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = nullptr,
-                 uint64_t *d_sram_to_reg_debug = nullptr,
-                 uint64_t *d_wait_debug = nullptr) {
+__global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
     /**
      * - Each thread block computes a BM x BN tile of the output matrix C.
      * - Each warp computes a WM x WN tile of the output matrix C.
@@ -44,6 +41,7 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
     int bx0 = blockIdx.x * BN;
     int by0 = blockIdx.y * BM;
     int warpIdx = threadIdx.x / 32; // 1d warp index in 2d grid (BM / WM) x (BN / WN)
+    int laneId = threadIdx.x % 32;
     int wy0 = WM * (warpIdx / (BN / WN));
     int wx0 = WN * (warpIdx % (BN / WN));
 
@@ -56,17 +54,9 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
     uint32_t *ra1 = reinterpret_cast<uint32_t *>(a1_frag);
     uint32_t *rb1 = reinterpret_cast<uint32_t *>(b1_frag);
 
-    float c_frag[(WM * WN / 256) * 8] = {0.0f}; // TODO: Consider double buffering for c_frag
-
-    uint32_t laneId = threadIdx.x % 32;
+    float c_frag[(WM * WN / 256) * 8] = {0.0f};
 
     int iterCount = 0;
-#ifdef DEBUG
-    uint64_t total_prefetch_cycles = 0;
-    uint64_t total_sram_to_reg_cycles = 0;
-    uint64_t total_wait_cycles = 0;
-    uint64_t sample_count = 0;
-#endif
     for (int k0 = 0; k0 < m; k0 += BK, iterCount++) {
         // /* -- DRAM -> SRAM -- */
         // Initialize SRAM with the first tile
@@ -90,11 +80,6 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
 
         // Prefetch next tile
         int nextK0 = k0 + BK;
-#ifdef DEBUG
-        uint64_t prefetch_t0 = 0;
-        if (laneId == 0)
-            prefetch_t0 = clock64();
-#endif
         if (nextK0 < m) {
             for (int idx = threadIdx.x; idx < BM * (BK / 8); idx += blockDim.x) {
                 int ay = idx / (BK / 8);
@@ -110,20 +95,9 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
             }
         }
         __pipeline_commit();
-#ifdef DEBUG
-        if (laneId == 0) {
-            uint64_t prefetch_t1 = clock64();
-            total_prefetch_cycles += prefetch_t1 - prefetch_t0;
-        }
-#endif
 
         /* -- SRAM -> Register  -- */
         /* -- Register @ Register => Register  -- */
-#ifdef DEBUG
-        uint64_t sram_to_reg_t0 = 0;
-        if (laneId == 0)
-            sram_to_reg_t0 = clock64();
-#endif
         bf16 *curSA = &sA[(iterCount & 1) * BM * ldsa];
         bf16 *curSB = &sB[(iterCount & 1) * BK * ldsb];
         uint32_t pRow = laneId % 16;
@@ -190,41 +164,9 @@ tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m, uint64_t *d_prefetch_debug = 
                      : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]), "r"(mmaRB[2]),
                        "r"(mmaRB[3]));
 
-#ifdef DEBUG
-        if (laneId == 0) {
-            uint64_t sram_to_reg_t1 = clock64();
-            total_sram_to_reg_cycles += sram_to_reg_t1 - sram_to_reg_t0;
-        }
-#endif
-
-#ifdef DEBUG
-        uint64_t wait_t0 = 0;
-        if (laneId == 0)
-            wait_t0 = clock64();
-#endif
         __pipeline_wait_prior(0);
-#ifdef DEBUG
-        if (laneId == 0) {
-            uint64_t wait_t1 = clock64();
-            total_wait_cycles += wait_t1 - wait_t0;
-            sample_count++;
-        }
-#endif
         __syncthreads();
     }
-
-#ifdef DEBUG
-    int warpsPerBlock = blockDim.x / 32;
-    int blockLinear = blockIdx.x + blockIdx.y * gridDim.x;
-    int globalWarp = blockLinear * warpsPerBlock + warpIdx;
-    if (laneId == 0) {
-        if (sample_count > 0) {
-            d_prefetch_debug[globalWarp] += total_prefetch_cycles / sample_count;
-            d_sram_to_reg_debug[globalWarp] += total_sram_to_reg_cycles / sample_count;
-            d_wait_debug[globalWarp] += total_wait_cycles / sample_count;
-        }
-    }
-#endif
 
     /* -- Register -> (Cache) -> DRAM  -- */
     uint32_t groupId = laneId >> 2;
@@ -257,42 +199,15 @@ void launchTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     static_cast<int>(smemBytes)));
 
-#ifdef DEBUG
-    uint64_t *d_prefetch_debug;
-    uint64_t *d_sram_to_reg_debug;
-    uint64_t *d_wait_debug;
-    int numBlocks = grid.x * grid.y;
-    int warpsPerBlock = block.x / 32;
-    int numWarps = numBlocks * warpsPerBlock;
-
-    cudaMallocManaged(&d_prefetch_debug, numWarps * sizeof(uint64_t));
-    cudaMallocManaged(&d_sram_to_reg_debug, numWarps * sizeof(uint64_t));
-    cudaMallocManaged(&d_wait_debug, numWarps * sizeof(uint64_t));
-    cudaMemset(d_prefetch_debug, 0, numWarps * sizeof(uint64_t));
-    cudaMemset(d_sram_to_reg_debug, 0, numWarps * sizeof(uint64_t));
-    cudaMemset(d_wait_debug, 0, numWarps * sizeof(uint64_t));
-#endif
-
     auto reset = [&]() { CUDA_CHECK(cudaMemset(ctx.C, 0, ctx.numElems * sizeof(bf16))); };
     auto fetch = [&]() { return std::vector<bf16>(ctx.C, ctx.C + ctx.numElems); };
     Stats stats;
-#ifdef DEBUG
-    int launch_count = 0;
-    auto result = runKernelBenchmark<std::vector<bf16>>(
-        [&]() {
-            ++launch_count;
-            tileMatmulKernel<BM, BN, BK, WM, WN><<<grid, block, smemBytes>>>(
-                ctx.A, ctx.B, ctx.C, m, d_prefetch_debug, d_sram_to_reg_debug, d_wait_debug);
-        },
-        reset, fetch, ctx.warmup, ctx.iters, stats);
-#else
     auto result = runKernelBenchmark<std::vector<bf16>>(
         [&]() {
             tileMatmulKernel<BM, BN, BK, WM, WN>
                 <<<grid, block, smemBytes>>>(ctx.A, ctx.B, ctx.C, m);
         },
         reset, fetch, ctx.warmup, ctx.iters, stats);
-#endif
 
     std::string label = specLabel(spec);
     printStats(label.c_str(), stats, ctx.flops);
@@ -301,30 +216,6 @@ void launchTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
     } else {
         printf("  -> INCORRECT\n");
     }
-
-#ifdef DEBUG
-    uint64_t total_prefetch_cycles = 0;
-    uint64_t total_sram_to_reg_cycles = 0;
-    uint64_t total_wait_cycles = 0;
-
-    for (int i = 0; i < numWarps; i++) {
-        uint64_t prefetch_avg = d_prefetch_debug[i] / launch_count;
-        uint64_t sram_to_reg_avg = d_sram_to_reg_debug[i] / launch_count;
-        uint64_t wait_avg = d_wait_debug[i] / launch_count;
-
-        total_prefetch_cycles += prefetch_avg;
-        total_sram_to_reg_cycles += sram_to_reg_avg;
-        total_wait_cycles += wait_avg;
-    }
-
-    printf("Warp(lane0)-scope avg cycles: prefetch=%lu, sram_to_reg+mmas=%lu, wait_prior=%lu\n",
-           total_prefetch_cycles / numWarps, total_sram_to_reg_cycles / numWarps,
-           total_wait_cycles / numWarps);
-
-    cudaFree(d_prefetch_debug);
-    cudaFree(d_sram_to_reg_debug);
-    cudaFree(d_wait_debug);
-#endif
 }
 
 // --- Config dispatch table ---
@@ -341,8 +232,6 @@ struct TileConfig {
 
 static const TileConfig tileConfigs[] = {
     TILE_CFG(128, 128, 32, 64, 64),
-    // TILE_CFG(128, 128, 32, 32, 32),
-    // TILE_CFG(128, 128, 32, 32, 16),
 };
 
 void runTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {

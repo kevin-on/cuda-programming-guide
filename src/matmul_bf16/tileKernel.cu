@@ -45,33 +45,34 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
     int wy0 = WM * (warpIdx / (BN / WN));
     int wx0 = WN * (warpIdx % (BN / WN));
 
-    bf16 a0_frag[8];
-    bf16 b0_frag[8];
-    bf16 a1_frag[16];
-    bf16 b1_frag[16];
-    uint32_t *ra0 = reinterpret_cast<uint32_t *>(a0_frag);
-    uint32_t *rb0 = reinterpret_cast<uint32_t *>(b0_frag);
-    uint32_t *ra1 = reinterpret_cast<uint32_t *>(a1_frag);
-    uint32_t *rb1 = reinterpret_cast<uint32_t *>(b1_frag);
+    bf16 a_frag[8];
+    bf16 b_frag[8];
+    uint32_t *ra = reinterpret_cast<uint32_t *>(a_frag);
+    uint32_t *rb = reinterpret_cast<uint32_t *>(b_frag);
 
     float c_frag[(WM * WN / 256) * 8] = {0.0f};
 
     int iterCount = 0;
     for (int k0 = 0; k0 < m; k0 += BK, iterCount++) {
+        bf16 *readSA = &sA[(iterCount & 1) * BM * ldsa];
+        bf16 *readSB = &sB[(iterCount & 1) * BK * ldsb];
+        bf16 *writeSA = &sA[((iterCount + 1) & 1) * BM * ldsa];
+        bf16 *writeSB = &sB[((iterCount + 1) & 1) * BK * ldsb];
+
         // /* -- DRAM -> SRAM -- */
-        // Initialize SRAM with the first tile
+        // First iteration: load the first tile
         if (iterCount == 0) {
             for (int idx = threadIdx.x; idx < BM * (BK / 8); idx += blockDim.x) {
                 int ay = idx / (BK / 8);
                 int ax = (idx % (BK / 8)) * 8;
-                __pipeline_memcpy_async(&sA[INDX(ay, ax, ldsa) + (iterCount & 1) * BM * ldsa],
-                                        &A[INDX(by0 + ay, k0 + ax, m)], 8 * sizeof(bf16));
+                __pipeline_memcpy_async(&readSA[INDX(ay, ax, ldsa)], &A[INDX(by0 + ay, k0 + ax, m)],
+                                        8 * sizeof(bf16));
             }
             for (int idx = threadIdx.x; idx < BK * (BN / 8); idx += blockDim.x) {
                 int by = idx / (BN / 8);
                 int bx = (idx % (BN / 8)) * 8;
-                __pipeline_memcpy_async(&sB[INDX(by, bx, ldsb) + (iterCount & 1) * BK * ldsb],
-                                        &B[INDX(k0 + by, bx0 + bx, m)], 8 * sizeof(bf16));
+                __pipeline_memcpy_async(&readSB[INDX(by, bx, ldsb)], &B[INDX(k0 + by, bx0 + bx, m)],
+                                        8 * sizeof(bf16));
             }
             __pipeline_commit();
             __pipeline_wait_prior(0);
@@ -84,13 +85,13 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
             for (int idx = threadIdx.x; idx < BM * (BK / 8); idx += blockDim.x) {
                 int ay = idx / (BK / 8);
                 int ax = (idx % (BK / 8)) * 8;
-                __pipeline_memcpy_async(&sA[INDX(ay, ax, ldsa) + ((iterCount + 1) & 1) * BM * ldsa],
+                __pipeline_memcpy_async(&writeSA[INDX(ay, ax, ldsa)],
                                         &A[INDX(by0 + ay, nextK0 + ax, m)], 8 * sizeof(bf16));
             }
             for (int idx = threadIdx.x; idx < BK * (BN / 8); idx += blockDim.x) {
                 int by = idx / (BN / 8);
                 int bx = (idx % (BN / 8)) * 8;
-                __pipeline_memcpy_async(&sB[INDX(by, bx, ldsb) + ((iterCount + 1) & 1) * BK * ldsb],
+                __pipeline_memcpy_async(&writeSB[INDX(by, bx, ldsb)],
                                         &B[INDX(nextK0 + by, bx0 + bx, m)], 8 * sizeof(bf16));
             }
         }
@@ -98,85 +99,53 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
 
         /* -- SRAM -> Register  -- */
         /* -- Register @ Register => Register  -- */
-        bf16 *curSA = &sA[(iterCount & 1) * BM * ldsa];
-        bf16 *curSB = &sB[(iterCount & 1) * BK * ldsb];
         uint32_t pRow = laneId % 16;
         uint32_t pCol = (laneId < 16) ? 0 : 8;
 
-        int mmaIterCount = 0;
-        float *last_c_frag_ptr = nullptr;
-#pragma unroll
         for (int k = 0; k < BK; k += 16) {
-#pragma unroll
-            for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++, mmaIterCount++) {
+            for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++) {
                 int ty0 = 16 * (tileIdx / (WN / 16));
                 int tx0 = 16 * (tileIdx % (WN / 16));
                 uint32_t pa =
-                    __cvta_generic_to_shared(&curSA[INDX(wy0 + ty0 + pRow, k + pCol, ldsa)]);
+                    __cvta_generic_to_shared(&readSA[INDX(wy0 + ty0 + pRow, k + pCol, ldsa)]);
                 uint32_t pb =
-                    __cvta_generic_to_shared(&curSB[INDX(k + pRow, wx0 + tx0 + pCol, ldsb)]);
-                uint32_t *mmaRA = (mmaIterCount & 0x1) ? ra1 : ra0;
-                uint32_t *ldRA = (mmaIterCount & 0x1) ? ra0 : ra1;
-                uint32_t *mmaRB = (mmaIterCount & 0x1) ? rb1 : rb0;
-                uint32_t *ldRB = (mmaIterCount & 0x1) ? rb0 : rb1;
+                    __cvta_generic_to_shared(&readSB[INDX(k + pRow, wx0 + tx0 + pCol, ldsb)]);
 
-                float *c_frag_ptr = last_c_frag_ptr;
-                last_c_frag_ptr = &c_frag[tileIdx * 8];
+                float *c_frag_ptr = &c_frag[tileIdx * 8];
 
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(ldRA[0]), "=r"(ldRA[1]), "=r"(ldRA[2]), "=r"(ldRA[3])
+                             : "=r"(ra[0]), "=r"(ra[1]), "=r"(ra[2]), "=r"(ra[3])
                              : "r"(pa));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(ldRB[0]), "=r"(ldRB[1]), "=r"(ldRB[2]), "=r"(ldRB[3])
+                             : "=r"(rb[0]), "=r"(rb[1]), "=r"(rb[2]), "=r"(rb[3])
                              : "r"(pb));
-                if (mmaIterCount == 0)
-                    continue; // skip mma for the first iteration
-
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                              : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]), "+f"(c_frag_ptr[2]),
                                "+f"(c_frag_ptr[3])
-                             : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]),
-                               "r"(mmaRB[0]), "r"(mmaRB[1]));
+                             : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[0]),
+                               "r"(rb[1]));
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                              : "+f"(c_frag_ptr[4]), "+f"(c_frag_ptr[5]), "+f"(c_frag_ptr[6]),
                                "+f"(c_frag_ptr[7])
-                             : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]),
-                               "r"(mmaRB[2]), "r"(mmaRB[3]));
+                             : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[2]),
+                               "r"(rb[3]));
             }
         }
-
-        // Compute mma for the last iteration
-        uint32_t *mmaRA = (mmaIterCount & 0x1) ? ra1 : ra0;
-        uint32_t *mmaRB = (mmaIterCount & 0x1) ? rb1 : rb0;
-        float *c_frag_ptr = last_c_frag_ptr;
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                     : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]), "+f"(c_frag_ptr[2]),
-                       "+f"(c_frag_ptr[3])
-                     : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]), "r"(mmaRB[0]),
-                       "r"(mmaRB[1]));
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                     : "+f"(c_frag_ptr[4]), "+f"(c_frag_ptr[5]), "+f"(c_frag_ptr[6]),
-                       "+f"(c_frag_ptr[7])
-                     : "r"(mmaRA[0]), "r"(mmaRA[1]), "r"(mmaRA[2]), "r"(mmaRA[3]), "r"(mmaRB[2]),
-                       "r"(mmaRB[3]));
 
         __pipeline_wait_prior(0);
         __syncthreads();
     }
 
     /* -- Register -> (Cache) -> DRAM  -- */
-    uint32_t groupId = laneId >> 2;
-    uint32_t threadId_in_group = laneId % 4;
+    int groupId = laneId >> 2;
+    int threadId_in_group = laneId % 4;
 
     for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++) {
         int ty0 = 16 * (tileIdx / (WN / 16));
         int tx0 = 16 * (tileIdx % (WN / 16));
         float *c_frag_ptr = &c_frag[tileIdx * 8];
-#pragma unroll
         for (int i = 0; i < 8; i++) {
             uint32_t row = ((i % 4) < 2) ? groupId : groupId + 8;
             uint32_t col = (threadId_in_group * 2) + (i & 0x1) + (i < 4 ? 0 : 8);

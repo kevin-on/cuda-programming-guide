@@ -10,7 +10,7 @@ using namespace nvcuda;
 
 #define INDX(row, col, ld) ((row) * (ld) + (col))
 
-template <int BM, int BN, int BK, int WM, int WN>
+template <int BM, int BN, int BK, int WM, int WN, int RM, int RN>
 __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
     /**
      * - Each thread block computes a BM x BN tile of the output matrix C.
@@ -45,12 +45,9 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
     int wy0 = WM * (warpIdx / (BN / WN));
     int wx0 = WN * (warpIdx % (BN / WN));
 
-    bf16 a_frag[8];
-    bf16 b_frag[8];
-    uint32_t *ra = reinterpret_cast<uint32_t *>(a_frag);
-    uint32_t *rb = reinterpret_cast<uint32_t *>(b_frag);
-
-    float c_frag[(WM * WN / 256) * 8] = {0.0f};
+    bf16 a_frag[(RM / 16)][8];
+    bf16 b_frag[(RN / 16)][8];
+    float c_frag[(WM / 16)][(WN / 16)][8] = {0.0f};
 
     int iterCount = 0;
     for (int k0 = 0; k0 < m; k0 += BK, iterCount++) {
@@ -108,56 +105,78 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
 #ifdef DEBUG_SKIP_MMA
         uint32_t ldsm_keep = 0;
 #endif
-
         for (int k = 0; k < BK; k += 16) {
-            for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++) {
-                int ty0 = 16 * (tileIdx / (WN / 16));
-                int tx0 = 16 * (tileIdx % (WN / 16));
-                uint32_t pa =
-                    __cvta_generic_to_shared(&readSA[INDX(wy0 + ty0 + pRow, k + pCol, ldsa)]);
-                uint32_t pb =
-                    __cvta_generic_to_shared(&readSB[INDX(k + pRow, wx0 + tx0 + pCol, ldsb)]);
-
-                float *c_frag_ptr = &c_frag[tileIdx * 8];
-
+            for (int ty0 = 0; ty0 < WM; ty0 += RM) {
+                for (int tx0 = 0; tx0 < WN; tx0 += RN) {
+                    for (int raIdx = 0; raIdx < (RM / 16); raIdx++) {
+                        uint32_t *ra_ptr = reinterpret_cast<uint32_t *>(&a_frag[raIdx][0]);
+                        int ry0 = raIdx * 16;
+                        uint32_t pa = __cvta_generic_to_shared(
+                            &readSA[INDX(wy0 + ty0 + ry0 + pRow, k + pCol, ldsa)]);
 #ifdef DEBUG_SKIP_LDMATRIX
-                ra[0] = pa;
-                ra[1] = pa ^ 0x11111111u;
-                ra[2] = pa ^ 0x22222222u;
-                ra[3] = pa ^ 0x33333333u;
-                rb[0] = pb;
-                rb[1] = pb ^ 0x44444444u;
-                rb[2] = pb ^ 0x88888888u;
-                rb[3] = pb ^ 0xccccccccu;
-                asm volatile(""
-                             : "+r"(ra[0]), "+r"(ra[1]), "+r"(ra[2]), "+r"(ra[3]), "+r"(rb[0]),
-                               "+r"(rb[1]), "+r"(rb[2]), "+r"(rb[3]));
+                        ra_ptr[0] = pa;
+                        ra_ptr[1] = pa ^ 0x11111111u;
+                        ra_ptr[2] = pa ^ 0x22222222u;
+                        ra_ptr[3] = pa ^ 0x33333333u;
+                        asm volatile(""
+                                     : "+r"(ra_ptr[0]), "+r"(ra_ptr[1]), "+r"(ra_ptr[2]),
+                                       "+r"(ra_ptr[3]));
 #else
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(ra[0]), "=r"(ra[1]), "=r"(ra[2]), "=r"(ra[3])
-                             : "r"(pa));
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(rb[0]), "=r"(rb[1]), "=r"(rb[2]), "=r"(rb[3])
-                             : "r"(pb));
+                        asm volatile(
+                            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                            : "=r"(ra_ptr[0]), "=r"(ra_ptr[1]), "=r"(ra_ptr[2]), "=r"(ra_ptr[3])
+                            : "r"(pa));
 #endif
+                    }
 
-#ifdef DEBUG_SKIP_MMA
-                ldsm_keep ^= (ra[0] ^ ra[1] ^ rb[0] ^ rb[1]);
-                ldsm_keep ^= (ra[2] ^ ra[3] ^ rb[2] ^ rb[3]);
+                    for (int rbIdx = 0; rbIdx < (RN / 16); rbIdx++) {
+                        uint32_t *rb_ptr = reinterpret_cast<uint32_t *>(&b_frag[rbIdx][0]);
+                        int rx0 = rbIdx * 16;
+                        uint32_t pb = __cvta_generic_to_shared(
+                            &readSB[INDX(k + pRow, wx0 + tx0 + rx0 + pCol, ldsb)]);
+#ifdef DEBUG_SKIP_LDMATRIX
+                        rb_ptr[0] = pb;
+                        rb_ptr[1] = pb ^ 0x11111111u;
+                        rb_ptr[2] = pb ^ 0x22222222u;
+                        rb_ptr[3] = pb ^ 0x33333333u;
+                        asm volatile(""
+                                     : "+r"(rb_ptr[0]), "+r"(rb_ptr[1]), "+r"(rb_ptr[2]),
+                                       "+r"(rb_ptr[3]));
 #else
-                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                             : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]), "+f"(c_frag_ptr[2]),
-                               "+f"(c_frag_ptr[3])
-                             : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[0]),
-                               "r"(rb[1]));
-                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                             : "+f"(c_frag_ptr[4]), "+f"(c_frag_ptr[5]), "+f"(c_frag_ptr[6]),
-                               "+f"(c_frag_ptr[7])
-                             : "r"(ra[0]), "r"(ra[1]), "r"(ra[2]), "r"(ra[3]), "r"(rb[2]),
-                               "r"(rb[3]));
+                        asm volatile(
+                            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                            : "=r"(rb_ptr[0]), "=r"(rb_ptr[1]), "=r"(rb_ptr[2]), "=r"(rb_ptr[3])
+                            : "r"(pb));
 #endif
+                    }
+
+                    for (int raIdx = 0; raIdx < (RM / 16); raIdx++) {
+                        for (int rbIdx = 0; rbIdx < (RN / 16); rbIdx++) {
+                            int ry0 = raIdx * 16;
+                            int rx0 = rbIdx * 16;
+                            uint32_t *ra_ptr = reinterpret_cast<uint32_t *>(&a_frag[raIdx][0]);
+                            uint32_t *rb_ptr = reinterpret_cast<uint32_t *>(&b_frag[rbIdx][0]);
+                            float *c_frag_ptr = &c_frag[(ty0 + ry0) / 16][(tx0 + rx0) / 16][0];
+#ifdef DEBUG_SKIP_MMA
+                            ldsm_keep ^= (ra_ptr[0] ^ ra_ptr[1] ^ rb_ptr[0] ^ rb_ptr[1]);
+                            ldsm_keep ^= (ra_ptr[2] ^ ra_ptr[3] ^ rb_ptr[2] ^ rb_ptr[3]);
+#else
+                            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                         : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]),
+                                           "+f"(c_frag_ptr[2]), "+f"(c_frag_ptr[3])
+                                         : "r"(ra_ptr[0]), "r"(ra_ptr[1]), "r"(ra_ptr[2]),
+                                           "r"(ra_ptr[3]), "r"(rb_ptr[0]), "r"(rb_ptr[1]));
+                            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                         : "+f"(c_frag_ptr[4]), "+f"(c_frag_ptr[5]),
+                                           "+f"(c_frag_ptr[6]), "+f"(c_frag_ptr[7])
+                                         : "r"(ra_ptr[0]), "r"(ra_ptr[1]), "r"(ra_ptr[2]),
+                                           "r"(ra_ptr[3]), "r"(rb_ptr[2]), "r"(rb_ptr[3]));
+#endif
+                        }
+                    }
+                }
             }
         }
 #ifdef DEBUG_SKIP_MMA
@@ -166,7 +185,6 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
             sink[warpIdx] = ldsm_keep;
         }
 #endif
-
         __pipeline_wait_prior(0);
         __syncthreads();
     }
@@ -175,30 +193,30 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
     int groupId = laneId >> 2;
     int threadId_in_group = laneId % 4;
 
-    for (int tileIdx = 0; tileIdx < (WM / 16) * (WN / 16); tileIdx++) {
-        int ty0 = 16 * (tileIdx / (WN / 16));
-        int tx0 = 16 * (tileIdx % (WN / 16));
-        float *c_frag_ptr = &c_frag[tileIdx * 8];
+    for (int ty0 = 0; ty0 < WM; ty0 += 16) {
+        for (int tx0 = 0; tx0 < WN; tx0 += 16) {
+            float *c_frag_ptr = &c_frag[(ty0 / 16)][(tx0 / 16)][0];
 #ifdef DEBUG_SKIP_R2G_STORE
-        volatile float *sink = reinterpret_cast<volatile float *>(sA);
-        float acc = 0.0f;
-        for (int j = 0; j < 8; j++)
-            acc += c_frag_ptr[j];
-        if (laneId == 0)
-            sink[warpIdx] = acc;
-        asm volatile("" ::: "memory");
+            volatile float *sink = reinterpret_cast<volatile float *>(sA);
+            float acc = 0.0f;
+            for (int j = 0; j < 8; j++)
+                acc += c_frag_ptr[j];
+            if (laneId == 0)
+                sink[warpIdx] = acc;
+            asm volatile("" ::: "memory");
 #else
-        for (int i = 0; i < 8; i++) {
-            uint32_t row = ((i % 4) < 2) ? groupId : groupId + 8;
-            uint32_t col = (threadId_in_group * 2) + (i & 0x1) + (i < 4 ? 0 : 8);
-            C[INDX(by0 + wy0 + ty0 + row, bx0 + wx0 + tx0 + col, m)] =
-                __float2bfloat16(c_frag_ptr[i]);
-        }
+            for (int i = 0; i < 8; i++) {
+                uint32_t row = ((i % 4) < 2) ? groupId : groupId + 8;
+                uint32_t col = (threadId_in_group * 2) + (i & 0x1) + (i < 4 ? 0 : 8);
+                C[INDX(by0 + wy0 + ty0 + row, bx0 + wx0 + tx0 + col, m)] =
+                    __float2bfloat16(c_frag_ptr[i]);
+            }
 #endif
+        }
     }
 }
 
-template <int BM, int BN, int BK, int WM, int WN>
+template <int BM, int BN, int BK, int WM, int WN, int RM, int RN>
 void launchTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
     int m = ctx.m;
     dim3 block(32 * BM * BN / (WM * WN));
@@ -207,7 +225,7 @@ void launchTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
     constexpr size_t sABytesAligned = ((sABytes + 15) / 16) * 16;
     constexpr size_t sBBytes = 2ULL * BK * (BN + 8) * sizeof(bf16);
     constexpr size_t smemBytes = sABytesAligned + sBBytes;
-    CUDA_CHECK(cudaFuncSetAttribute(tileMatmulKernel<BM, BN, BK, WM, WN>,
+    CUDA_CHECK(cudaFuncSetAttribute(tileMatmulKernel<BM, BN, BK, WM, WN, RM, RN>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     static_cast<int>(smemBytes)));
 
@@ -216,7 +234,7 @@ void launchTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
     Stats stats;
     auto result = runKernelBenchmark<std::vector<bf16>>(
         [&]() {
-            tileMatmulKernel<BM, BN, BK, WM, WN>
+            tileMatmulKernel<BM, BN, BK, WM, WN, RM, RN>
                 <<<grid, block, smemBytes>>>(ctx.A, ctx.B, ctx.C, m);
         },
         reset, fetch, ctx.warmup, ctx.iters, stats);
@@ -235,25 +253,31 @@ void launchTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
 using TileFn = void (*)(const MatmulBenchCtx &, const KernelSpec &);
 
 struct TileConfig {
-    int bm, bn, bk, wm, wn;
+    int bm, bn, bk, wm, wn, rm, rn;
     TileFn fn;
 };
 
-#define TILE_CFG(BM, BN, BK, WM, WN)                                                               \
-    { BM, BN, BK, WM, WN, launchTileMatmul<BM, BN, BK, WM, WN> }
+#define TILE_CFG(BM, BN, BK, WM, WN, RM, RN)                                                       \
+    { BM, BN, BK, WM, WN, RM, RN, launchTileMatmul<BM, BN, BK, WM, WN, RM, RN> }
 
 static const TileConfig tileConfigs[] = {
-    TILE_CFG(128, 128, 32, 64, 64),
+    TILE_CFG(128, 128, 32, 64, 64, 32, 32),
+
+    // TILE_CFG(128, 128, 32, 64, 64, 16, 16), TILE_CFG(128, 128, 32, 64, 64, 32, 16),
+    // TILE_CFG(128, 128, 32, 64, 64, 32, 32), TILE_CFG(128, 128, 32, 64, 64, 64, 32),
+    // TILE_CFG(128, 128, 32, 64, 64, 64, 64),
 };
 
 void runTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
     int bm = spec.at("bm"), bn = spec.at("bn"), bk = spec.at("bk");
-    int wm = spec.at("wm"), wn = spec.at("wn");
+    int wm = spec.at("wm"), wn = spec.at("wn"), rm = spec.at("rm"), rn = spec.at("rn");
     for (auto &cfg : tileConfigs) {
-        if (cfg.bm == bm && cfg.bn == bn && cfg.bk == bk && cfg.wm == wm && cfg.wn == wn) {
+        if (cfg.bm == bm && cfg.bn == bn && cfg.bk == bk && cfg.wm == wm && cfg.wn == wn &&
+            cfg.rm == rm && cfg.rn == rn) {
             cfg.fn(ctx, spec);
             return;
         }
     }
-    fprintf(stderr, "No compiled config for bm=%d bn=%d bk=%d wm=%d wn=%d\n", bm, bn, bk, wm, wn);
+    fprintf(stderr, "No compiled config for bm=%d bn=%d bk=%d wm=%d wn=%d rm=%d rn=%d\n", bm, bn,
+            bk, wm, wn, rm, rn);
 }

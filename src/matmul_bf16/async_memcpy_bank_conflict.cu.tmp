@@ -1,0 +1,46 @@
+#include <cuda/cmath>
+#include <cuda_pipeline.h>
+#include <stdio.h>
+
+#define INDX(row, col, ld) ((row) * (ld) + (col))
+
+constexpr int MATRIX_M = 256;
+constexpr int SMEM_M = 128;
+constexpr int SMEM_N = 32;
+constexpr int SMEM_PAD = 0;
+constexpr int THREADS_PER_BLOCK = 32;
+constexpr int SMEM_CHUNK_SIZE = 4;
+
+__device__ __forceinline__ void compilerBarrier() { asm volatile("" ::: "memory"); }
+
+__global__ void asyncMemcpyKernel(float *d_A) {
+    __shared__ float smem[SMEM_M][SMEM_N + SMEM_PAD];
+
+    for (int idx = threadIdx.x; idx < SMEM_M * (SMEM_N / SMEM_CHUNK_SIZE); idx += blockDim.x) {
+        int row = idx / (SMEM_N / SMEM_CHUNK_SIZE);
+        int colChunkIdx = idx % (SMEM_N / SMEM_CHUNK_SIZE);
+        int col = colChunkIdx * SMEM_CHUNK_SIZE;
+        int swizzledCol = (colChunkIdx ^ (row & 0x7)) * SMEM_CHUNK_SIZE;
+        printf("threadIdx.x: %d, row: %d, col: %d, swizzledCol: %d\n", threadIdx.x, row, col,
+               swizzledCol);
+        __pipeline_memcpy_async(&smem[row][swizzledCol], &d_A[INDX(row, col, MATRIX_M)],
+                                SMEM_CHUNK_SIZE * sizeof(float));
+    }
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    compilerBarrier();
+}
+
+int main(int argc, char **argv) {
+    float *d_A;
+    cudaMallocManaged(&d_A, MATRIX_M * MATRIX_M * sizeof(float));
+    for (int i = 0; i < MATRIX_M * MATRIX_M; i++) {
+        d_A[i] = rand() / (float)RAND_MAX;
+    }
+    asyncMemcpyKernel<<<1, THREADS_PER_BLOCK>>>(d_A);
+    cudaDeviceSynchronize();
+    cudaFree(d_A);
+    return 0;
+}

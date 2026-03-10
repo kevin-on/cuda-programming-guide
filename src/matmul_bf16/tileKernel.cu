@@ -9,6 +9,10 @@
 using namespace nvcuda;
 
 #define INDX(row, col, ld) ((row) * (ld) + (col))
+#define SWZ8(row, col, ld) ((row) * (ld) + (((col) >> 3) ^ ((row)&0x7)) * 8)
+
+constexpr int LDSA_PAD = 0;
+constexpr int LDSB_PAD = 0;
 
 template <int BM, int BN, int BK, int WM, int WN, int RM, int RN>
 __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
@@ -30,8 +34,8 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
      *       BM=128, BN=128, BK=32, WM=64, WN=64: 117.41 TFLOPS
      */
 
-    constexpr int ldsa = BK + 8;
-    constexpr int ldsb = BN + 8;
+    constexpr int ldsa = BK + LDSA_PAD;
+    constexpr int ldsb = BN + LDSB_PAD;
     constexpr size_t sABytes = 2ULL * BM * ldsa * sizeof(bf16);
     constexpr size_t sABytesAligned = ((sABytes + 15) / 16) * 16;
     extern __shared__ __align__(16) unsigned char smem[];
@@ -65,13 +69,13 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
             for (int idx = threadIdx.x; idx < BM * (BK / 8); idx += blockDim.x) {
                 int ay = idx / (BK / 8);
                 int ax = (idx % (BK / 8)) * 8;
-                __pipeline_memcpy_async(&readSA[INDX(ay, ax, ldsa)], &A[INDX(by0 + ay, k0 + ax, m)],
+                __pipeline_memcpy_async(&readSA[SWZ8(ay, ax, ldsa)], &A[INDX(by0 + ay, k0 + ax, m)],
                                         8 * sizeof(bf16));
             }
             for (int idx = threadIdx.x; idx < BK * (BN / 8); idx += blockDim.x) {
                 int by = idx / (BN / 8);
                 int bx = (idx % (BN / 8)) * 8;
-                __pipeline_memcpy_async(&readSB[INDX(by, bx, ldsb)], &B[INDX(k0 + by, bx0 + bx, m)],
+                __pipeline_memcpy_async(&readSB[SWZ8(by, bx, ldsb)], &B[INDX(k0 + by, bx0 + bx, m)],
                                         8 * sizeof(bf16));
             }
             __pipeline_commit();
@@ -85,13 +89,13 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
             for (int idx = threadIdx.x; idx < BM * (BK / 8); idx += blockDim.x) {
                 int ay = idx / (BK / 8);
                 int ax = (idx % (BK / 8)) * 8;
-                __pipeline_memcpy_async(&writeSA[INDX(ay, ax, ldsa)],
+                __pipeline_memcpy_async(&writeSA[SWZ8(ay, ax, ldsa)],
                                         &A[INDX(by0 + ay, nextK0 + ax, m)], 8 * sizeof(bf16));
             }
             for (int idx = threadIdx.x; idx < BK * (BN / 8); idx += blockDim.x) {
                 int by = idx / (BN / 8);
                 int bx = (idx % (BN / 8)) * 8;
-                __pipeline_memcpy_async(&writeSB[INDX(by, bx, ldsb)],
+                __pipeline_memcpy_async(&writeSB[SWZ8(by, bx, ldsb)],
                                         &B[INDX(nextK0 + by, bx0 + bx, m)], 8 * sizeof(bf16));
             }
         }
@@ -112,7 +116,7 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                         uint32_t *ra_ptr = reinterpret_cast<uint32_t *>(&a_frag[raIdx][0]);
                         int ry0 = raIdx * 16;
                         uint32_t pa = __cvta_generic_to_shared(
-                            &readSA[INDX(wy0 + ty0 + ry0 + pRow, k + pCol, ldsa)]);
+                            &readSA[SWZ8(wy0 + ty0 + ry0 + pRow, k + pCol, ldsa)]);
 #ifdef DEBUG_SKIP_LDMATRIX
                         ra_ptr[0] = pa;
                         ra_ptr[1] = pa ^ 0x11111111u;
@@ -133,7 +137,7 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                         uint32_t *rb_ptr = reinterpret_cast<uint32_t *>(&b_frag[rbIdx][0]);
                         int rx0 = rbIdx * 16;
                         uint32_t pb = __cvta_generic_to_shared(
-                            &readSB[INDX(k + pRow, wx0 + tx0 + rx0 + pCol, ldsb)]);
+                            &readSB[SWZ8(k + pRow, wx0 + tx0 + rx0 + pCol, ldsb)]);
 #ifdef DEBUG_SKIP_LDMATRIX
                         rb_ptr[0] = pb;
                         rb_ptr[1] = pb ^ 0x11111111u;
@@ -221,9 +225,9 @@ void launchTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {
     int m = ctx.m;
     dim3 block(32 * BM * BN / (WM * WN));
     dim3 grid(cuda::ceil_div(m, BN), cuda::ceil_div(m, BM));
-    constexpr size_t sABytes = 2ULL * BM * (BK + 8) * sizeof(bf16);
+    constexpr size_t sABytes = 2ULL * BM * (BK + LDSA_PAD) * sizeof(bf16);
     constexpr size_t sABytesAligned = ((sABytes + 15) / 16) * 16;
-    constexpr size_t sBBytes = 2ULL * BK * (BN + 8) * sizeof(bf16);
+    constexpr size_t sBBytes = 2ULL * BK * (BN + LDSB_PAD) * sizeof(bf16);
     constexpr size_t smemBytes = sABytesAligned + sBBytes;
     CUDA_CHECK(cudaFuncSetAttribute(tileMatmulKernel<BM, BN, BK, WM, WN, RM, RN>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -262,10 +266,7 @@ struct TileConfig {
 
 static const TileConfig tileConfigs[] = {
     TILE_CFG(128, 128, 32, 64, 64, 32, 32),
-
-    // TILE_CFG(128, 128, 32, 64, 64, 16, 16), TILE_CFG(128, 128, 32, 64, 64, 32, 16),
-    // TILE_CFG(128, 128, 32, 64, 64, 32, 32), TILE_CFG(128, 128, 32, 64, 64, 64, 32),
-    // TILE_CFG(128, 128, 32, 64, 64, 64, 64),
+    TILE_CFG(128, 128, 64, 64, 64, 32, 32),
 };
 
 void runTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {

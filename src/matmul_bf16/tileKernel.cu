@@ -11,6 +11,19 @@ using namespace nvcuda;
 #define INDX(row, col, ld) ((row) * (ld) + (col))
 #define SWZ8(row, col, ld) ((row) * (ld) + (((col) >> 3) ^ ((row)&0x7)) * 8)
 
+// #ifndef DEBUG_SKIP_G2S_LOAD
+// #define DEBUG_SKIP_G2S_LOAD
+// #endif
+#ifndef DEBUG_SKIP_LDMATRIX
+#define DEBUG_SKIP_LDMATRIX
+#endif
+#ifndef DEBUG_SKIP_MMA
+#define DEBUG_SKIP_MMA
+#endif
+#ifndef DEBUG_SKIP_R2G_STORE
+#define DEBUG_SKIP_R2G_STORE
+#endif
+
 constexpr int LDSA_PAD = 0;
 constexpr int LDSB_PAD = 0;
 
@@ -53,6 +66,16 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
     bf16 b_frag[(RN / 16)][8];
     float c_frag[(WM / 16)][(WN / 16)][8] = {0.0f};
 
+#ifdef DEBUG_MEASURE_TIME
+    uint64_t kernel_start_time = 0;
+    uint64_t pipeline_commit_cycle_count = 0;
+    uint64_t pipeline_wait_prior_cycle_count = 0;
+    bool isMeasuringThread = blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0;
+    if (isMeasuringThread) {
+        kernel_start_time = clock64();
+    }
+#endif
+
     int iterCount = 0;
     for (int k0 = 0; k0 < m; k0 += BK, iterCount++) {
         bf16 *readSA = &sA[(iterCount & 1) * BM * ldsa];
@@ -64,6 +87,12 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
 #ifdef DEBUG_SKIP_G2S_LOAD
         // Do nothing
 #else
+#ifdef DEBUG_MEASURE_TIME
+        uint64_t pipeline_commit_start_time, pipeline_commit_end_time, pipeline_wait_prior_end_time;
+        if (isMeasuringThread) {
+            pipeline_commit_start_time = clock64();
+        }
+#endif
         // First iteration: load the first tile
         if (iterCount == 0) {
             for (int idx = threadIdx.x; idx < BM * (BK / 8); idx += blockDim.x) {
@@ -79,8 +108,6 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                                         8 * sizeof(bf16));
             }
             __pipeline_commit();
-            __pipeline_wait_prior(0);
-            __syncthreads();
         }
 
         // Prefetch next tile
@@ -100,6 +127,23 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
             }
         }
         __pipeline_commit();
+
+#ifdef DEBUG_MEASURE_TIME
+        if (isMeasuringThread) {
+            pipeline_commit_end_time = clock64();
+            pipeline_commit_cycle_count += (pipeline_commit_end_time - pipeline_commit_start_time);
+        }
+#endif
+        __pipeline_wait_prior(1);
+        __syncthreads();
+
+#ifdef DEBUG_MEASURE_TIME
+        if (isMeasuringThread) {
+            pipeline_wait_prior_end_time = clock64();
+            pipeline_wait_prior_cycle_count +=
+                (pipeline_wait_prior_end_time - pipeline_commit_end_time);
+        }
+#endif
 #endif
 
         /* -- SRAM -> Register  -- */
@@ -131,6 +175,10 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                             : "=r"(ra_ptr[0]), "=r"(ra_ptr[1]), "=r"(ra_ptr[2]), "=r"(ra_ptr[3])
                             : "r"(pa));
 #endif
+
+#ifdef DEBUG_SKIP_MMA
+                        ldsm_keep ^= ra_ptr[0];
+#endif
                     }
 
                     for (int rbIdx = 0; rbIdx < (RN / 16); rbIdx++) {
@@ -152,8 +200,14 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                             : "=r"(rb_ptr[0]), "=r"(rb_ptr[1]), "=r"(rb_ptr[2]), "=r"(rb_ptr[3])
                             : "r"(pb));
 #endif
+
+#ifdef DEBUG_SKIP_MMA
+                        ldsm_keep ^= rb_ptr[0];
+#endif
                     }
 
+#ifdef DEBUG_SKIP_MMA
+#else
                     for (int raIdx = 0; raIdx < (RM / 16); raIdx++) {
                         for (int rbIdx = 0; rbIdx < (RN / 16); rbIdx++) {
                             int ry0 = raIdx * 16;
@@ -161,10 +215,6 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                             uint32_t *ra_ptr = reinterpret_cast<uint32_t *>(&a_frag[raIdx][0]);
                             uint32_t *rb_ptr = reinterpret_cast<uint32_t *>(&b_frag[rbIdx][0]);
                             float *c_frag_ptr = &c_frag[(ty0 + ry0) / 16][(tx0 + rx0) / 16][0];
-#ifdef DEBUG_SKIP_MMA
-                            ldsm_keep ^= (ra_ptr[0] ^ ra_ptr[1] ^ rb_ptr[0] ^ rb_ptr[1]);
-                            ldsm_keep ^= (ra_ptr[2] ^ ra_ptr[3] ^ rb_ptr[2] ^ rb_ptr[3]);
-#else
                             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                                          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                                          : "+f"(c_frag_ptr[0]), "+f"(c_frag_ptr[1]),
@@ -177,9 +227,9 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                                            "+f"(c_frag_ptr[6]), "+f"(c_frag_ptr[7])
                                          : "r"(ra_ptr[0]), "r"(ra_ptr[1]), "r"(ra_ptr[2]),
                                            "r"(ra_ptr[3]), "r"(rb_ptr[2]), "r"(rb_ptr[3]));
-#endif
                         }
                     }
+#endif
                 }
             }
         }
@@ -189,7 +239,8 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
             sink[warpIdx] = ldsm_keep;
         }
 #endif
-        __pipeline_wait_prior(0);
+
+        /* -- Synchronize threads -- */
         __syncthreads();
     }
 
@@ -218,6 +269,14 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
 #endif
         }
     }
+
+#ifdef DEBUG_MEASURE_TIME
+    if (isMeasuringThread) {
+        printf("pipeline_commit_cycle_count: %lu\n", pipeline_commit_cycle_count);
+        printf("pipeline_wait_prior_cycle_count: %lu\n", pipeline_wait_prior_cycle_count);
+        printf("kernel_cycle_count: %llu\n", clock64() - kernel_start_time);
+    }
+#endif
 }
 
 template <int BM, int BN, int BK, int WM, int WN, int RM, int RN>
@@ -265,8 +324,10 @@ struct TileConfig {
     { BM, BN, BK, WM, WN, RM, RN, launchTileMatmul<BM, BN, BK, WM, WN, RM, RN> }
 
 static const TileConfig tileConfigs[] = {
-    TILE_CFG(128, 128, 32, 64, 64, 32, 32),
-    TILE_CFG(128, 128, 64, 64, 64, 32, 32),
+    TILE_CFG(256, 128, 32, 64, 64, 32, 32),
+    // TILE_CFG(128, 128, 32, 64, 64, 32, 32),
+    // TILE_CFG(128, 256, 32, 64, 64, 32, 32),
+    // TILE_CFG(128, 128, 64, 64, 64, 32, 32),
 };
 
 void runTileMatmul(const MatmulBenchCtx &ctx, const KernelSpec &spec) {

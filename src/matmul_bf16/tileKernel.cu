@@ -14,18 +14,34 @@ using namespace nvcuda;
 // #ifndef DEBUG_SKIP_G2S_LOAD
 // #define DEBUG_SKIP_G2S_LOAD
 // #endif
-#ifndef DEBUG_SKIP_LDMATRIX
-#define DEBUG_SKIP_LDMATRIX
-#endif
-#ifndef DEBUG_SKIP_MMA
-#define DEBUG_SKIP_MMA
-#endif
-#ifndef DEBUG_SKIP_R2G_STORE
-#define DEBUG_SKIP_R2G_STORE
-#endif
+// #ifndef DEBUG_SKIP_LDMATRIX
+// #define DEBUG_SKIP_LDMATRIX
+// #endif
+// #ifndef DEBUG_SKIP_MMA
+// #define DEBUG_SKIP_MMA
+// #endif
+// #ifndef DEBUG_SKIP_R2G_STORE
+// #define DEBUG_SKIP_R2G_STORE
+// #endif
 
 constexpr int LDSA_PAD = 0;
 constexpr int LDSB_PAD = 0;
+
+__device__ __forceinline__ void seedAccumulatorTile(float *frag, const uint32_t *a,
+                                                    const uint32_t *b) {
+    asm volatile("mov.b32 %0, %8;\n"
+                 "mov.b32 %1, %9;\n"
+                 "mov.b32 %2, %10;\n"
+                 "mov.b32 %3, %11;\n"
+                 "mov.b32 %4, %12;\n"
+                 "mov.b32 %5, %13;\n"
+                 "mov.b32 %6, %14;\n"
+                 "mov.b32 %7, %15;\n"
+                 : "=f"(frag[0]), "=f"(frag[1]), "=f"(frag[2]), "=f"(frag[3]), "=f"(frag[4]),
+                   "=f"(frag[5]), "=f"(frag[6]), "=f"(frag[7])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(b[2]),
+                   "r"(b[3]));
+}
 
 template <int BM, int BN, int BK, int WM, int WN, int RM, int RN>
 __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
@@ -207,6 +223,16 @@ __global__ void tileMatmulKernel(bf16 *A, bf16 *B, bf16 *C, int m) {
                     }
 
 #ifdef DEBUG_SKIP_MMA
+                    for (int raIdx = 0; raIdx < (RM / 16); raIdx++) {
+                        for (int rbIdx = 0; rbIdx < (RN / 16); rbIdx++) {
+                            int ry0 = raIdx * 16;
+                            int rx0 = rbIdx * 16;
+                            uint32_t *ra_ptr = reinterpret_cast<uint32_t *>(&a_frag[raIdx][0]);
+                            uint32_t *rb_ptr = reinterpret_cast<uint32_t *>(&b_frag[rbIdx][0]);
+                            float *c_frag_ptr = &c_frag[(ty0 + ry0) / 16][(tx0 + rx0) / 16][0];
+                            seedAccumulatorTile(c_frag_ptr, ra_ptr, rb_ptr);
+                        }
+                    }
 #else
                     for (int raIdx = 0; raIdx < (RM / 16); raIdx++) {
                         for (int rbIdx = 0; rbIdx < (RN / 16); rbIdx++) {
